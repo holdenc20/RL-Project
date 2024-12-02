@@ -5,7 +5,7 @@ import random
 
 
 Batch = namedtuple(
-    'Batch', ('states', 'actions', 'rewards', 'next_states', 'dones')
+    'Batch', ('observations', 'actions', 'rewards', 'next_states', 'dones')
 )
 
 
@@ -24,6 +24,9 @@ class ReplayMemory:
         self.idx = 0 # Pointer to the current location in the circular buffer
 
         self.size = 0 # Indicates number of transitions currently stored in the buffer
+
+    def __len__(self):
+        return self.size
 
     def add(self, observations, action, reward, next_state, done):
         """Add a transition to the buffer."""
@@ -53,29 +56,45 @@ class ReplayMemory:
 
         return batch
 
-    def populate(self, env, num_steps):
+
+    @staticmethod
+    def populate(env, num_steps, agent_memory, memory):
         """Populate this replay memory with `num_steps` from the random policy."""
-        #observations, infos = 
-        env.reset()
+        # Reset the environment to start collecting data
+        observations, _ = env.reset()  # This returns the initial observations for all agents
+        
         for _ in range(num_steps):
             actions = {}
             for agent in env.agents:
-                action_space = env.action_space(agent)
-                #actions[agent] = action_space.sample()
-
-            next_observations, rewards, terminations, truncations, infos = {}, {}, {}, {}, {}#env.step(actions)
-            """
+                # Sample a random action from the agent's action space
+                action_space = env.action_spaces[agent]
+                actions[agent] = action_space.sample()  # Random action
+                
+            # Take a step in the environment with the chosen actions
+            next_observations, rewards, terminations, truncations, infos = env.step(actions)
+            
+            # Add the experience (state, action, reward, next_state, done) to the memory buffer
             for agent in env.agents:
-                done = terminations[agent] or truncations[agent]
-                self.add(
-                    observations[agent],
-                    actions[agent],
-                    rewards[agent],
-                    next_observations[agent],
-                    done
-                )"""
-    
+                done = terminations[agent] or truncations[agent]  # Check if the episode is done
+                if agent == 'agent_0':
+                    agent_memory.add(
+                        observations[agent],  # Current state of the agent
+                        actions[agent],       # Action taken by the agent
+                        rewards[agent],       # Reward received by the agent
+                        next_observations[agent],  # Next state of the agent
+                        done                  # Whether the episode is done for the agent
+                    )
+                else:
+                    memory.add(
+                        observations[agent],  # Current state of the agent
+                        actions[agent],       # Action taken by the agent
+                        rewards[agent],       # Reward received by the agent
+                        next_observations[agent],  # Next state of the agent
+                        done                  # Whether the episode is done for the agent
+                    )
+
+            # If all agents are done (terminated or truncated), reset the environment
             if all(terminations.values()) or all(truncations.values()):
-                env.reset()
+                observations, _ = env.reset()
             else:
-                observations = next_observations
+                observations = next_observations  # Update observations for the next step
