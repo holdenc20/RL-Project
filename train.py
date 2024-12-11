@@ -13,162 +13,148 @@ from ReplayMemory import ReplayMemory
 def train_dqn_batch(optimizer, batch, dqn_model, dqn_target, gamma) -> float:
     """Perform a single batch-update step on the given DQN model."""
     states, actions, rewards, next_states, dones = batch
-    q_values = dqn_model(states)
-    values = q_values.gather(1, actions).squeeze(-1)
+    
+    # Get the Q-values for each agent
+    q_values = dqn_model(states)  # Shape: [batch_size, num_actions]
+    
+    # Gather the Q-values for selected actions
+    values = q_values.gather(1, actions)  # actions should be [batch_size, 1]
+    values = values.squeeze(1)  # Remove extra dimension, values shape will be [batch_size]
 
-    next_q_values = dqn_target(next_states).detach()
-    max_next_q_values = next_q_values.max(dim=1)[0]
+    with torch.no_grad():
+        # Get the next Q-values from the target model
+        next_q_values = dqn_target(next_states).detach()  # Shape: [batch_size, num_actions]
+        max_next_q_values = next_q_values.max(dim=1)[0]  # Get max Q-values across actions, shape: [batch_size]
+        # Compute target Q-values
 
-    target_values = rewards + gamma * max_next_q_values * (1 - dones.float())
-    target_values = target_values.detach()
+        dones = dones.squeeze(1)
+        rewards = rewards.squeeze(1)
+        target_values = rewards + gamma * (1 - dones.float()) * max_next_q_values  # Shape: [batch_size]
 
+    # Calculate the loss between the predicted Q-values and target Q-values
     loss = F.mse_loss(values, target_values)
 
+    # Perform the optimization step
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
     return loss.item()
 
-def train_playing_dqn(env, num_steps, *, num_saves=5, replay_size, replay_prepopulate_steps=0, batch_size, exploration, gamma):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Reset the environment
-    env.reset(seed=42)
+
+def train_iql(env, num_steps, *, num_saves=5, replay_size, replay_prepopulate_steps=0, batch_size, exploration, gamma):
+    env.reset()
     num_agents = len(env.agents)
     num_observations = env.observation_spaces[env.agents[0]].shape[0]
     num_actions = env.action_spaces[env.agents[0]].n
 
-    # Initialize the DQN model, optimizer, and replay memory
-    print("Initializing DQN model...")
-    print(num_observations)
-    print(num_actions)
+    print("Initializing IQL models for agents...")
+    print(f"Observations: {num_observations}, Actions: {num_actions}, Agents: {num_agents}")
 
+    agent_models = {
+        agent: {
+            "dqn_model": DQN(num_observations, num_actions, num_layers=3, hidden_dim=128),
+            "dqn_target": DQN(num_observations, num_actions, num_layers=3, hidden_dim=128),
+            "optimizer": torch.optim.RMSprop(DQN(num_observations, num_actions, num_layers=3, hidden_dim=128).parameters(), lr=5e-5, alpha=0.99, eps=1e-5),
+            "replay_memory": ReplayMemory(replay_size, num_observations),
+        }
+        for agent in env.agents
+    }
 
-    dqn_model = DQN(num_observations, num_actions, num_layers=4, hidden_dim=256).to(device)
+    # Prepopulate replay memories
+    for agent in env.agents:
+        agent_models[agent]["replay_memory"].populate(env, replay_prepopulate_steps)
 
-
-    num_observations_agent = env.observation_spaces['agent_0'].shape[0]
-    num_actions_agent = env.action_spaces['agent_0'].n
-    dqn_agent_model = DQN(num_observations_agent, num_actions_agent, num_layers=4, hidden_dim=256).to(device)
-
-    
-    optimizer = torch.optim.Adam(dqn_model.parameters())
-    optimizer_agent = torch.optim.Adam(dqn_agent_model.parameters())
-
-    memory = ReplayMemory(replay_size, num_observations)    
-
-    memory_agent = ReplayMemory(replay_size, num_observations_agent)
-
-    # Populate the replay memory with random data
-    ReplayMemory.populate(env, replay_prepopulate_steps, memory_agent, memory)
-    ReplayMemory.populate(env, replay_prepopulate_steps, memory_agent, memory)
-
-
-    losses_agent = []
-    losses = []
-
-    rewards = []
+    losses = {agent: [] for agent in env.agents}
+    total_rewards = []
     t_total = 0
-
-    # Training Loop
+    steps = 0
     for eps in tqdm(range(int(num_steps))):
-        observations, _ = env.reset()  # Reset the environment at the start of each episode
+        observations, _ = env.reset()
         t_episode = 0
-        while t_episode < 1000 and env.agents:
-            done = False
-            eps = exploration.value(t_total)  # Get the exploration value (epsilon-greedy)
-            actions = {}  # Dictionary to store actions for each agent
+        steps += 1
+
+        while t_episode < 26 and env.agents:
+            eps_value = exploration.value(t_total)
+            actions = {}
 
             for agent in env.agents:
-                #print("Agent:", agent)
                 observation = observations[agent]
-                observation = torch.tensor(observation, dtype=torch.float32, device=device, requires_grad=False)
+                observation = torch.tensor(observation, dtype=torch.float32)
 
-                if random.random() > eps:
-                    # Use DQN to choose an action (exploitation)
-                    if agent == 'agent_0':
-                        q_values = dqn_agent_model(observation.unsqueeze(0).to(device))
-                    else:
-                        q_values = dqn_model(observation.unsqueeze(0).to(device))  # Feed observation to model
-                    policy = F.softmax(q_values, dim=-1).detach()
-                    action = torch.argmax(policy, dim=-1).item()
+                if random.random() > eps_value:
+                    # Exploitation
+                    q_values = agent_models[agent]["dqn_model"](observation.unsqueeze(0))
+                    action = torch.argmax(q_values, dim=-1).item()
                 else:
-                    # Random action for exploration
-                    action = env.action_spaces[agent].sample()  # Randomly sample an action
-                    #print(f"Random action for {agent}: {action}")
+                    # Exploration
+                    action = env.action_spaces[agent].sample()
 
+                actions[agent] = action
 
-                #print("Observations:", len(observation))
-                actions[agent] = action  # Store the action for the agent
-
-            observations, rewards, terminations, truncations, _= env.step(actions)
-
+            next_observations, rewards, terminations, truncations, _ = env.step(actions)
 
             for agent in env.agents:
-                if agent == 'agent_0':
-                    memory_agent.add(observations[agent], actions[agent], rewards[agent], observations[agent], terminations[agent] or truncations[agent])
-                else:
-                    memory.add(observations[agent], actions[agent], rewards[agent], observations[agent], terminations[agent] or truncations[agent])
+                agent_models[agent]["replay_memory"].add(
+                    observations[agent],
+                    actions[agent],
+                    rewards[agent],
+                    next_observations[agent],
+                    terminations[agent] or truncations[agent],
+                )
 
-            if len(memory) >= batch_size:
-                #model
-                batch = memory.sample(batch_size)
-                loss = train_dqn_batch(optimizer, batch, dqn_model, dqn_model, gamma)
-                losses.append(loss)
+                # Train the agent if replay memory has enough samples
+                if len(agent_models[agent]["replay_memory"]) >= batch_size:
+                    batch = agent_models[agent]["replay_memory"].sample(batch_size)
+                    loss = train_dqn_batch(
+                        agent_models[agent]["optimizer"],
+                        batch,
+                        agent_models[agent]["dqn_model"],
+                        agent_models[agent]["dqn_target"],
+                        gamma,
+                    )
+                    print(f"Agent {agent} loss: {loss}")
+                    #losses[agent].append(loss)
 
-            if len(memory_agent) >= batch_size:
-                #agent model
-                batch_agent = memory_agent.sample(batch_size)
-                loss = train_dqn_batch(optimizer_agent, batch_agent, dqn_agent_model, dqn_agent_model, gamma)
-                losses_agent.append(loss)
+                # Update the target network periodically
+                if t_total % 500 == 0:
+                    agent_models[agent]["dqn_target"].load_state_dict(agent_models[agent]["dqn_model"].state_dict())
 
-            # Track and log rewards, terminations, and truncations
-            #print("------------------------------")
-            #print("Iteration:", t_total)
-            for agent in env.agents:
-                reward = rewards[agent]
-                termination = terminations[agent]
-                truncation = truncations[agent]
-                #print(f"Agent {agent} - Reward: {reward}, Termination: {termination}, Truncation: {truncation}")
-            
-                if terminations[agent] or truncations[agent]:
-                    done = True
-                if rewards[agent] == -10:
-                    done = True
-
+                observations[agent] = next_observations[agent]
             t_total += 1
             t_episode += 1
 
+        if steps % 50 == 0:
+            test_iql_rewards = test_iql(env, agent_models, num_episodes=50)
+            total_rewards.append(test_iql_rewards)
+            print(f"Episode: {eps}, Test reward: {test_iql_rewards}")
+
     env.close()
-    return dqn_model, dqn_agent_model, losses_agent, losses
+    return agent_models, losses, total_rewards
 
-def test(env, current_dqn_model, old_dqn_model):
-    total = 0
-    for i in range(100):
-        env.reset(seed=42)
+
+
+def test_iql(env, agent_models, num_episodes=10):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    total_rewards = 0
+    for _ in range(num_episodes):
+        observations, _ = env.reset()
         done = False
-        total_reward = 0
-        while not done:
-            q_values = (
-                current_dqn_model(torch.tensor(state, dtype=torch.float32))
-                if env.current_player == 0
-                else old_dqn_model(torch.tensor(state, dtype=torch.float32))
-            )
+        steps = 0
 
-            possible_actions = env.possible_actions()
-            if len(possible_actions) == 0:
-                break
-            num_actions = q_values.size(0)
-            mask = torch.full((num_actions,), float('-inf'))
-            mask[possible_actions] = 0
+        while not done and env.agents and steps < 26:
+            actions = {}
+            for agent in env.agents:
+                observation = torch.tensor(observations[agent], dtype=torch.float32, device=device)
+                q_values = agent_models[agent]["dqn_model"](observation.unsqueeze(0).to(device))
+                action = torch.argmax(q_values, dim=-1).item()
+                actions[agent] = action
 
-            masked_q_values = q_values + mask
-            action = torch.argmax(masked_q_values).item()
+            observations, rewards, term, trunc, _ = env.step(actions)
+            total_rewards += sum(rewards.values())
 
-            state, reward, done, _ = env.step(action)
-            total_reward += reward
+            done = any(term.values()) or any(trunc.values())
 
-        total += total_reward
-
-    return total / 10
+    return total_rewards / num_episodes
